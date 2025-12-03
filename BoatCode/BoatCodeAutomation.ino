@@ -175,8 +175,7 @@ void controlThrottle() {
     if (automationThrottle > 0) {
         // Map throttle percentage to PWM (0-100% -> 0-UINT16_MAX)
         int throttlePWM = map(automationThrottle, 0, 100, 0, UINT16_MAX);
-        // Apply safety limit (max 40% power)
-        throttlePWM = min(throttlePWM, (4 * UINT16_MAX) / 10);
+       
         
         digitalWrite(THROTTLE_PIN, LOW); // Forward direction
         analogWrite(PWM1, throttlePWM);
