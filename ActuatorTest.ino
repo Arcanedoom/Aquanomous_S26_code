@@ -22,6 +22,7 @@ void setup() {
   digitalWrite(STEERING_LEFT_PIN, LOW);
   digitalWrite(STEERING_RIGHT_PIN, LOW);
 
+  // OLED init
   display.init();
   display.setFont(ArialMT_Plain_16);
   display.clear();
@@ -68,4 +69,13 @@ void loop() {
   display.drawString(0, 0, "STEERING");
 
   if (steeringState == 'L') {
-    display.drawString(0, 20, "L
+    display.drawString(0, 20, "LEFT");
+  } else if (steeringState == 'R') {
+    display.drawString(0, 20, "RIGHT");
+  } else {
+    display.drawString(0, 20, "CENTER");
+  }
+
+  display.display();
+  delay(50);
+}
