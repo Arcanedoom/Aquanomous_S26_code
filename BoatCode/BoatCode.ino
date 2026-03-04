@@ -68,10 +68,11 @@ int bufferSize;
 bool automationMode = false; // Flag for automation mode
 
 // Pin Definitions
-#define THROTTLE_PIN GPIO5
+
+#define THROTTLE_PIN GPIO5 //direction pin
 #define STEERING_LEFT_PIN GPIO7
 #define STEERING_RIGHT_PIN GPIO6
-#define MOTOR_RELAY GPIO4
+#define MOTOR_RELAY GPIO4 //
 #define KILL_SWITCH GPIO9
 
 
