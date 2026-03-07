@@ -175,7 +175,7 @@ void controlThrottle() {
     if (automationThrottle > 0) {
         // Map throttle percentage to PWM (0-100% -> 0-UINT16_MAX)
         int throttlePWM = map(automationThrottle, 0, 100, 0, UINT16_MAX);
-        digitalWrite(THROTTLE_PIN, LOW); // Forward direction
+        digitalWrite(THROTTLE_PIN, HIGH); // Forward direction?
         analogWrite(PWM1, throttlePWM);
     } else {
         analogWrite(PWM1, 0); // Stop motor
