@@ -27,7 +27,7 @@ THROTTLE_ID = 3
 STEERING_ID = 1
 
 ### Collision detection function
-def collision_detection():
+def collision_detection_cam():
     ret, img = cap.read()
     if not ret:
         return None, None
@@ -84,40 +84,82 @@ ser = serial.Serial('/dev/serial0', baudrate=9600, timeout=5)
 # Initialize collision_avoidance
 collision_avoidance = False
 
+gps_recovery = 0 # flag for if attempt to recover from losing GPS to restart route
+# 0 do not recover from GPS
+# 1 attempt to get GPS again to continue the mission and
+# 2 testing only, do not override throttle and steering if no GPS 
+
+gps_fix = 0 #the GPS FIX TYPE, assume no gps at first
+gps_status = 0 # 0 = no GPS, 1 = have GPS  
+no_gps_period = 3 # how long to attempt to get GPS before signaling no GPS in ms
+no_gps_count = 0 # ms counter for how long 
+gps_period = 3 # how long GPS needs to be received to confirm GPS in ms
+gps_count = 0 # ms counter for how long GPS is still receiving
+
+
 ### Main loop
 while True:
-    # Pull message from MAVLink
-    mav_message = connection.recv_match(type='SERVO_OUTPUT_RAW', blocking=True) #Should blocking equal true?
-    servo_throttle = f"servo{THROTTLE_ID}_raw"
-    servo_steering = f"servo{STEERING_ID}_raw"
-    mav_throttle = getattr(mav_message, servo_throttle)
-    mav_steering = getattr(mav_message, servo_steering)
+    throttle = 50
+    steering = 50
+    # Pull messages from MAVLink
+    msg_servo = connection.recv_match(type='SERVO_OUTPUT_RAW', blocking=True) 
+    msg_gps = connection.recv_match(type='GPS_RAW_INT', blocking=True) 
+    # parse servo data 
+    if msg_servo is not None:
+        servo_throttle = f"servo{THROTTLE_ID}_raw"
+        servo_steering = f"servo{STEERING_ID}_raw"
+        mav_throttle = getattr(msg_servo, servo_throttle)
+        mav_steering = getattr(msg_servo, servo_steering)
 
-    cd_throttle, cd_steering = collision_detection()
-    print(f"Throttle: {cd_throttle}, Steering: {cd_steering}")
-    if cd_throttle is not None and cd_steering is not None:
-        collision_avoidance = True
-    else:
-        collision_avoidance = False
+        #check collision 
+        cd_throttle, cd_steering = collision_detection_cam()
+        print(f"Throttle: {cd_throttle}, Steering: {cd_steering}")
+        if cd_throttle is not None and cd_steering is not None:
+            collision_avoidance = True
+        else:
+            collision_avoidance = False
 
-    # Prepare the message
-    if collision_avoidance:
-        throttle = cd_throttle
-        steering = cd_steering
-    else:
-        mav_throttle = mav_throttle if mav_throttle is not None else 1500
-        mav_steering = mav_steering if mav_steering is not None else 1500
-        throttle = max(0, min(100, int((mav_throttle - 1000) / 10)))
-        steering = max(0, min(100, int((mav_steering - 1000) / 10)))
+        # check if running with GPS kill switch
+        if gps_recovery < 2:
+            #check GPS status
+            if msg_gps is not None:
+                gps_status = f"fix_type"
+                gps_fix = getattr(msg_gps, gps_status)  # get the fix from the message 
+            # if getting no GPS data
+            if gps_fix < 2:
+                no_gps_count = no_gps_count +1
+                print(no_gps_count)
+                if no_gps_count >= no_gps_period:
+                    print('NO GPS')
+                    gps_status = 0
+            
 
-    # Create a bytes object with two uint8_t values for UART
-    message = bytes([throttle, steering])
 
-    #Disable for debugging
-    ser.write(message)
+        # Prepare the message
+        if collision_avoidance:
+            throttle = cd_throttle
+            steering = cd_steering
+        # gps status has been set to 'no GPS'
+        # if running GPS kill switch
+        elif gps_recovery < 2:
+            if gps_status == 0:
+                throttle = 255
+                steering = 255
+        else:
+            mav_throttle = mav_throttle if mav_throttle is not None else 1500
+            mav_steering = mav_steering if mav_steering is not None else 1500
+            throttle = max(0, min(100, int((mav_throttle - 1000) / 10)))
+            steering = max(0, min(100, int((mav_steering - 1000) / 10)))
 
-    # Debug sent message print
-    print(f"Sent: Throttle={message[0]}, Steering={message[1]}")
+        print(throttle)
+        # Create a bytes object with two uint8_t values for UART
+        message = bytes([throttle, 44, steering, 10])
 
-    time.sleep(0.001)  # Small delay to reduce CPU usage?
+        #Disable for debugging
+        ser.write(message)
+
+        # Debug sent message print
+        print(f"Sent: Throttle={message[0]}, Steering={message[2]}")
+
+        time.sleep(0.001)  # Small delay to reduce CPU usage?
 # cap.released necessary here?
