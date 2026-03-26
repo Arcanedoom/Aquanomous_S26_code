@@ -11,6 +11,7 @@ import subprocess
 import time
 import serial
 from pymavlink import mavutil
+from gpiozero import LED
 
 ### Variables
 # Predefined HSV values, to be determined using the PC program beforehand
@@ -96,6 +97,13 @@ no_gps_count = 0 # ms counter for how long
 gps_period = 3 # how long GPS needs to be received to confirm GPS in ms
 gps_count = 0 # ms counter for how long GPS is still receiving
 
+# gpio test, assignment
+# 20 = center, 19 = forward, 12 = BW, 6 = left, 13 = right
+ctr = LED(20)
+fw = LED(19)
+bw = LED(12)
+lft = LED(6)
+rgt = LED(13)
 
 ### Main loop
 while True:
@@ -157,6 +165,40 @@ while True:
 
         #Disable for debugging
         ser.write(message)
+
+        # testing LED indicators
+        # 20 = center, 19 = forward, 12 = BW, 6 = left, 13 = right
+        if((throttle > 50) & (throttle < 100)):
+            # print("Throttle: ", throttle, ", Forward")
+            fw.on()
+            ctr.off()
+            bw.off()
+        elif(throttle < 50):
+            # print("Throttle: ", throttle, ", Backward")
+            fw.off()
+            ctr.off()
+            bw.on()
+        elif((throttle == 50) & (steering == 50)):
+            fw.off()
+            ctr.on()
+            bw.off()
+        if(throttle > 100):
+            # print("Throttle: ", throttle, ", KILLSWITCH")
+            fw.on()
+            ctr.on()
+            bw.on()
+        if((steering > 50) & (steering < 100)):
+            # print("Steering: ", steering, ", Right")
+            rgt.on()
+            lft.off()
+        elif(steering < 50):
+            # print("Steering: ", steering, ", Left")
+            rgt.on()
+            lft.off()
+        elif(steering > 100):
+            # print("Throttle: ", throttle, ", KILLSWITCH")
+            rgt.on()
+            lft.on()
 
         # Debug sent message print
         print(f"Sent: Throttle={message[0]}, Steering={message[2]}")
