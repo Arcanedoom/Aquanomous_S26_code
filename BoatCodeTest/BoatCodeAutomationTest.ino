@@ -395,11 +395,13 @@ void controlSteering() {
 
 void processUARTMessage(uint8_t *message, int length) {
     if (length == BUFFER_SIZE) {
-        automationThrottle = constrain(message[0], 0, 100);
-        automationSteering = constrain(message[1], 0, 100);
-        if (message[0] == 255) {
-            emergencyStopProcedure("PI COMMAND");
+        // Kill switch: any value outside 0–100 on either byte triggers emergency stop
+        if (message[0] > 100 || message[1] > 100) {
+            emergencyStopProcedure("OUT OF RANGE CMD");
+            return;
         }
+        automationThrottle = message[0];
+        automationSteering = message[1];
     }
 }
 
@@ -418,8 +420,7 @@ void emergencyStopProcedure(const char* reason) {
     display.drawString(0, 25, reason);
     display.display();
     while (true) {
-        delay(1000);
-        digitalWrite(KILL_SWITCH, !digitalRead(KILL_SWITCH));
+        delay(1000);  // just hang here, solenoid stays LOW
     }
 }
 
