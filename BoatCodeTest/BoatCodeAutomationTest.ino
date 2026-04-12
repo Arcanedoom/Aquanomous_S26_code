@@ -9,7 +9,7 @@
 // ================================================================
 // SIMULATION SETTINGS
 // ================================================================
-#define TEST_MODE true
+#define TEST_MODE false
 
 const uint8_t SIM_PACKETS[][2] = {
      {0,   0},   // stop, center
@@ -59,7 +59,8 @@ const int SIM_HOLD_TIME_MS = 3000;
 #define LORA_FIX_LENGTH_PAYLOAD_ON false
 #define LORA_IQ_INVERSION_ON false
 #define BUFFER_SIZE 2
-#define TIMEOUT 5
+#define TIMEOUT 10
+#define ALLOW_RECOVERY false
 
 Air530ZClass GPS;
 
@@ -94,10 +95,13 @@ void OnTxTimeout(void);
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
 void OnRxTimeout(void);
 
+int OutofRangeNumber = 0;
+int InRangeNumber = 0;
 uint32_t lastHeartbeatTime = 0;
 bool emergencyStop = false;
 
-uint8_t serialBuffer[BUFFER_SIZE];
+// uint8_t serialBuffer[BUFFER_SIZE];
+uint8_t serialBuffer[256];
 int bufferSize;
 
 // Pin Definitions
@@ -268,8 +272,9 @@ void setup() {
     display.drawString(0, 25, "Starting in 3s...");
     display.display();
 
-    lastHeartbeatTime = millis();
     delay(3000);
+    lastHeartbeatTime = millis();
+    
 }
 
 // ================================================================
@@ -282,15 +287,15 @@ void loop() {
         return;
     }
 
-    while (GPS.available()) { GPS.encode(GPS.read()); }
+    //while (GPS.available()) { GPS.encode(GPS.read()); }
 
     bufferSize = Serial1.read(serialBuffer, TIMEOUT);
     if (bufferSize == BUFFER_SIZE) {
         processUARTMessage(serialBuffer, bufferSize);
         lastHeartbeatTime = millis();
     }
-
-    if (millis() - lastHeartbeatTime > 5000) {
+ //Serial.printf("Made it to heartbeat");
+    if (millis() - lastHeartbeatTime > 10000) {
         emergencyStopProcedure("NO HEARTBEAT");
     }
 
@@ -304,10 +309,10 @@ void loop() {
         lastStatusTime = millis();
     }
 
-    Radio.Rx(1000);
-    delay(LOOP_INTERVAL_MS);
-    Radio.IrqProcess();
-}
+//     Radio.Rx(1000);
+//     delay(LOOP_INTERVAL_MS);
+//     Radio.IrqProcess();
+     }
 
 // ================================================================
 // CONTROL FUNCTIONS
@@ -339,7 +344,7 @@ void controlThrottle() {
         throttle += rampStep;
         throttle = min(throttle, targetPWM);
         throttle = min(throttle, (14 * UINT16_MAX) / 20);
-        digitalWrite(DIRECTION_PIN, LOW);
+        digitalWrite(DIRECTION_PIN, LOW);    
         analogWrite(PWM1, throttle);
     } else {
         if (throttle > 0) {
@@ -394,18 +399,46 @@ void controlSteering() {
 }
 
 void processUARTMessage(uint8_t *message, int length) {
-    if (length == BUFFER_SIZE) {
-        // Kill switch: any value outside 0–100 on either byte triggers emergency stop
-        if (message[0] > 100 || message[1] > 100) {
+    if (length != BUFFER_SIZE) return;
+
+    if (message[0] >= 100 || message[1] >= 100) {
+        OutofRangeNumber++;
+        InRangeNumber = 0;  // reset recovery progress on any bad packet
+        Serial.printf("  [UART] Out of range! bad:%d  T:%d S:%d\n",
+                      OutofRangeNumber, message[0], message[1]);
+        if (OutofRangeNumber >= 3) {
             emergencyStopProcedure("OUT OF RANGE CMD");
-            return;
         }
-        automationThrottle = message[0];
-        automationSteering = message[1];
+        return;
     }
+
+    // Good packet
+    OutofRangeNumber= 0;
+    InRangeNumber++;
+    Serial.printf("  [UART] Good packet, recovery:%d/3  T:%d S:%d\n",
+                  InRangeNumber, message[0], message[1]);
+
+    if ((emergencyStop) && (InRangeNumber >= 3)) {
+        OutofRangeNumber = 0;
+        if (ALLOW_RECOVERY) {
+            emergencyStop = false;
+            digitalWrite(KILL_SWITCH, HIGH);
+            Serial.println("  [UART] RECOVERED — emergency stop cleared");
+        } else {
+            Serial.println("  [UART] Recovery disabled — staying in emergency stop");
+        }
+    }
+
+    automationThrottle = message[0];
+    automationSteering = message[1];
+    Serial.printf("  [UART] T:%d S:%d\n", automationThrottle, automationSteering);
 }
+    
+
+  
 
 void emergencyStopProcedure(const char* reason) {
+    if (emergencyStop) return;  // already in emergency stop, don't re-trigger
     emergencyStop = true;
     analogWrite(PWM1, 0);
     digitalWrite(STEERING_LEFT_PIN, LOW);
@@ -419,9 +452,8 @@ void emergencyStopProcedure(const char* reason) {
     display.setFont(ArialMT_Plain_10);
     display.drawString(0, 25, reason);
     display.display();
-    while (true) {
-        delay(1000);  // just hang here, solenoid stays LOW
-    }
+    Serial.printf("  [ESTOP] %s\n", reason);
+    // no while(true) — loop() continues so UART can still be read for recovery
 }
 
 void updateDisplay() {
