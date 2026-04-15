@@ -1,0 +1,545 @@
+#include <Wire.h>
+#include "HT_SSD1306Wire.h"
+#include "Arduino.h"
+
+// ================================================================
+// CONFIGURATION
+// ================================================================
+#define TEST_MODE            true
+#define ALLOW_RECOVERY       false
+
+#define THROTTLE_RAMP_MS     4000   // ms to ramp 0 -> 100%
+#define THROTTLE_DECEL_MS    2000   // ms to ramp 100% -> 0
+#define LOOP_INTERVAL_MS     100    // must match delay() at bottom of loop()
+#define HEARTBEAT_TIMEOUT_MS 10000
+#define ESTOP_TRIGGER_COUNT  3
+#define RECOVERY_COUNT       3
+#define TEMP_THROTTLE_CAP_F    338.0f   // above this temp, motor capped at 50%
+//#define TEMP_THROTTLE_CAP_F    95.0f   // above this temp, motor capped at 50%
+
+#define TEMP_THROTTLE_CAP_PCT  50       // max throttle % when overtemp   
+// ================================================================
+
+// ================================================================
+// SIMULATION SETTINGS, testing throttle and steering
+// ================================================================
+const uint8_t SIM_PACKETS[][2] = {
+    {10,   50},   // stop, center
+    {40,  50},   // slow forward, center
+    {50,  40},   // forward, steer left
+    {70,  60},   // forward, steer right
+    {90,  50},   // medium forward
+    {90,  50},   // faster forward
+    {90,  50},   // fast forward
+    {90, 50},   // full forward
+    {90,  50},   // ease back
+    {90,   50},   // stop
+     {90,   50},   // stop, center
+    {90,  50},   // slow forward, center
+    {90,  40},   // forward, steer left
+    {90,  60},   // forward, steer right
+    {90,  50},   // medium forward
+    {90,  50},   // faster forward
+    {90,  50},   // fast forward
+    {90, 50},   // full forward
+    {90,  50},   // ease back
+    {90,   50},   // stop
+     {90,   50},   // stop, center
+    {90,  50},   // slow forward, center
+    {90,  40},   // forward, steer left
+    {90,  60},   // forward, steer right
+    {90,  50},   // medium forward
+    {90,  50},   // faster forward
+    {90,  50},   // fast forward
+    {90, 50},   // full forward
+    {90,  50},   // ease back
+    {90,   50},   // stop
+     {90,   50},   // stop, center
+    {90,  50},   // slow forward, center
+    {90,  40},   // forward, steer left
+    {90,  60},   // forward, steer right
+    {90,  50},   // medium forward
+    {90,  50},   // faster forward
+    {90,  50},   // fast forward
+    {90, 50},   // full forward
+    {90,  50},   // ease back
+    {90,   50}, 
+};
+const int SIM_PACKET_COUNT = sizeof(SIM_PACKETS) / sizeof(SIM_PACKETS[0]);
+const int SIM_HOLD_TIME_MS = 3000;
+// ================================================================
+
+// ================================================================
+// LORA — disabled, uncomment block to re-enable, this was for previous years teams using remote control
+// ================================================================
+// #include "LoRaWan_APP.h"
+// #define RF_FREQUENCY          915000000
+// #define TX_OUTPUT_POWER       21
+// #define LORA_BANDWIDTH        0
+// #define LORA_SPREADING_FACTOR 7
+// #define LORA_CODINGRATE       1
+// #define LORA_PREAMBLE_LENGTH  8
+// #define LORA_SYMBOL_TIMEOUT   0
+// #define LORA_FIX_LENGTH_PAYLOAD_ON false
+// #define LORA_IQ_INVERSION_ON       false
+// static RadioEvents_t RadioEvents;
+// ================================================================
+
+// ================================================================
+// GPS — disabled, uncomment to re-enable
+// ================================================================
+// #include "GPS_Air530Z.h"
+// Air530ZClass GPS;
+// ================================================================
+
+// ================================================================
+// UART
+// ================================================================
+#define BUFFER_SIZE 2
+
+uint8_t serialBuffer[256];
+int     bufferSize = 0;
+
+// ================================================================
+// PIN DEFINITIONS
+// ================================================================
+#define DIRECTION_PIN          GPIO5   // LOW=forward, HIGH=reverse, for competition we are not using reverse
+#define STEERING_LEFT_PIN      GPIO7
+#define STEERING_RIGHT_PIN     GPIO6
+#define MOTOR_RELAY            GPIO4
+#define KILL_SWITCH            GPIO9
+#define STEERING_POTENTIOMETER ADC3
+// PWM1 = GPIO3 (pin 10) — throttle signal to Curtis
+
+// ================================================================
+// THERMISTOR — wiring: 3.3V ── 10K Thermistor ── ADC2 ── 10K Resistor ── GND
+// ================================================================
+#define THERM_PIN           ADC1
+#define ADC_RESOLUTION      4096.0f
+#define ADC_REF_VOLTAGE     3.3f      // Internal reference on AB02S
+#define ADC_CAL_FACTOR      0.7099f   // Calibration: scales reading to true voltage
+#define SERIES_RESISTOR     10000.0f  // 10K series resistor (bottom of divider)
+#define NOMINAL_RESISTANCE  10000.0f  // Thermistor nominal resistance at 25°C
+#define NOMINAL_TEMP_C      25.0f
+#define BETA_COEFFICIENT    3950.0f
+// ================================================================
+
+// ================================================================
+// RUDDER CALIBRATION
+// ================================================================
+const int rudderMin       = 200;
+const int rudderMax       = 4000;
+const int rudderTolerance = 50;
+
+// ================================================================
+// STATE
+// ================================================================
+int  automationThrottle      = 0;
+int  automationSteering      = 50;
+int  currentSteeringPosition = 0;
+
+int  throttle      = 0;
+int  throttleState = 0;   // 1=forward, 0=stop
+
+bool     emergencyStop     = false;
+uint32_t lastHeartbeatTime = 0;
+int      OutofRangeNumber  = 0;
+int      InRangeNumber     = 0;
+
+float    currentTempF      = 0.0f;   // latest thermistor reading
+
+static SSD1306Wire display(0x3c, 500000, SDA, SCL, GEOMETRY_128_64, GPIO10);
+
+// ================================================================
+// FORWARD DECLARATIONS
+// ================================================================
+void controlThrottle();
+void controlSteering();
+void executeAutomation();
+void processUARTMessage(uint8_t *message, int length);
+void emergencyStopProcedure(const char* reason);
+void updateDisplay();
+float readThermistorF();
+void simDisplay(int packetNum, uint8_t thr, uint8_t steer, int pot, int rawThrottle, uint32_t elapsed);
+void runSimulation();
+
+// ================================================================
+// SETUP
+// ================================================================
+void setup() {
+    Serial.begin(115200);
+    Serial1.begin(9600);
+
+    pinMode(DIRECTION_PIN,          OUTPUT);
+    pinMode(STEERING_LEFT_PIN,      OUTPUT);
+    pinMode(STEERING_RIGHT_PIN,     OUTPUT);
+    pinMode(MOTOR_RELAY,            OUTPUT);
+    pinMode(KILL_SWITCH,            OUTPUT);
+    pinMode(STEERING_POTENTIOMETER, INPUT);
+    pinMode(THERM_PIN,              INPUT);
+
+    analogWrite(PWM1,                   0);
+    digitalWrite(DIRECTION_PIN,       LOW);
+    digitalWrite(STEERING_LEFT_PIN,   LOW);
+    digitalWrite(STEERING_RIGHT_PIN,  LOW);
+    digitalWrite(MOTOR_RELAY,        HIGH);
+    digitalWrite(KILL_SWITCH,        HIGH);
+
+    display.init();
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, TEST_MODE ? "SIM MODE" : "AUTO MODE");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 25, "Starting in 3s...");
+    display.display();
+
+    delay(3000);
+    lastHeartbeatTime = millis();
+}
+
+// ================================================================
+// LOOP
+// ================================================================
+void loop() {
+    if (TEST_MODE) {
+        runSimulation();
+        return;
+    }
+
+    if (Serial1.available() >= BUFFER_SIZE) {
+        bufferSize = Serial1.readBytes(serialBuffer, BUFFER_SIZE);
+        if (bufferSize == BUFFER_SIZE) {
+            processUARTMessage(serialBuffer, bufferSize);
+            lastHeartbeatTime = millis();
+        }
+    }
+
+    if (millis() - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
+        emergencyStopProcedure("NO HEARTBEAT");
+    }
+
+    currentTempF            = readThermistorF();
+    currentSteeringPosition = analogRead(STEERING_POTENTIOMETER);
+    executeAutomation();
+    updateDisplay();
+
+    delay(LOOP_INTERVAL_MS);
+}
+
+// ================================================================
+// THERMISTOR
+// ================================================================
+float readThermistorF() {
+    int   raw     = analogRead(THERM_PIN);
+    float voltage = (raw / ADC_RESOLUTION) * ADC_REF_VOLTAGE * ADC_CAL_FACTOR;   
+
+    if (voltage >= 3.3f || voltage <= 0.0f) {
+        Serial.println("  [THERM] ADC out of range — check wiring!");
+        return -999.0f;
+    }
+
+  float resistance = SERIES_RESISTOR * (voltage / (3.3f - voltage));
+    float steinhart  = resistance / NOMINAL_RESISTANCE;
+    steinhart        = log(steinhart);
+    steinhart       /= BETA_COEFFICIENT;
+    steinhart       += 1.0f / (NOMINAL_TEMP_C + 273.15f);
+    steinhart        = 1.0f / steinhart;
+
+    return (steinhart - 273.15f) * 9.0f / 5.0f + 32.0f;
+}
+
+// ================================================================
+// AUTOMATION
+// ================================================================
+void executeAutomation() {
+    if (emergencyStop) return;
+    controlThrottle();
+    controlSteering();
+}
+
+void controlThrottle() {
+    int targetPWM = (automationThrottle * UINT16_MAX) / 100;
+    int rampStep  = (UINT16_MAX * LOOP_INTERVAL_MS) / THROTTLE_RAMP_MS;
+    int decelStep = (UINT16_MAX * LOOP_INTERVAL_MS) / THROTTLE_DECEL_MS;
+
+    Serial.printf("  [THROTTLE] cmd:%d%% state:%d raw:%d targetPWM:%d\n",
+                  automationThrottle, throttleState, throttle, targetPWM);
+
+    if (automationThrottle > 0) {
+        if (throttleState != 1) {
+            throttleState = 1;
+            digitalWrite(DIRECTION_PIN, LOW);
+        }
+        throttle += rampStep;
+        throttle  = min(throttle, targetPWM);
+        throttle  = min(throttle, (14 * UINT16_MAX) / 20);
+
+        // Overtemp cap — clamp throttle to 50% if temperature exceeded
+        if (currentTempF > TEMP_THROTTLE_CAP_F) {
+            int capPWM = (TEMP_THROTTLE_CAP_PCT * UINT16_MAX) / 100;
+            throttle   = min(throttle, capPWM);
+            Serial.printf("  [THROTTLE] OVERTEMP %.1fF — capped at %d%%\n",
+                          currentTempF, TEMP_THROTTLE_CAP_PCT);
+        }
+
+        analogWrite(PWM1, throttle);
+    } else {
+        if (throttle > 0) {
+            throttle -= decelStep;
+            throttle  = max(throttle, 0);
+            analogWrite(PWM1, throttle);
+        } else {
+            throttleState = 0;
+            throttle      = 0;
+            analogWrite(PWM1, 0);
+        }
+    }
+}
+
+void controlSteering() {
+    int targetPosition = map(automationSteering, 0, 100, rudderMin, rudderMax);
+    int error          = currentSteeringPosition - targetPosition;
+
+    if (abs(error) <= rudderTolerance) {
+        digitalWrite(STEERING_LEFT_PIN,  LOW);
+        digitalWrite(STEERING_RIGHT_PIN, LOW);
+        return;
+    }
+
+    if (error > 0) {
+        digitalWrite(STEERING_LEFT_PIN,  HIGH);
+        digitalWrite(STEERING_RIGHT_PIN, LOW);
+    } else {
+        digitalWrite(STEERING_LEFT_PIN,  LOW);
+        digitalWrite(STEERING_RIGHT_PIN, HIGH);
+    }
+
+    // Stuck detection
+    static uint32_t turnStartTime = 0;
+    static int      lastPosition  = 0;
+
+    if (currentSteeringPosition == lastPosition) {
+        if (millis() - turnStartTime > 2000) {
+            digitalWrite(STEERING_LEFT_PIN,  LOW);
+            digitalWrite(STEERING_RIGHT_PIN, LOW);
+            emergencyStopProcedure("STEERING STUCK");
+        }
+    } else {
+        turnStartTime = millis();
+        lastPosition  = currentSteeringPosition;
+    }
+}
+
+// ================================================================
+// UART MESSAGE PROCESSING
+// ================================================================
+void processUARTMessage(uint8_t *message, int length) {
+    if (length != BUFFER_SIZE) return;
+
+    if (message[0] > 100 || message[1] > 100) {
+        OutofRangeNumber++;
+        InRangeNumber = 0;
+        Serial.printf("  [UART] Out of range! bad:%d  T:%d S:%d\n",
+                      OutofRangeNumber, message[0], message[1]);
+        if (OutofRangeNumber >= ESTOP_TRIGGER_COUNT) {
+            emergencyStopProcedure("OUT OF RANGE CMD");
+        }
+        return;
+    }
+    //Good Packet
+    OutofRangeNumber = 0;
+   
+    Serial.printf("  [UART] Good pkt recovery:%d/%d  T:%d S:%d\n",
+                  InRangeNumber, RECOVERY_COUNT, message[0], message[1]);
+
+    if (emergencyStop && InRangeNumber >= RECOVERY_COUNT) {
+        InRangeNumber++;
+        if (ALLOW_RECOVERY) {
+            emergencyStop = false;
+            digitalWrite(KILL_SWITCH, HIGH);
+            Serial.println("  [UART] RECOVERED — emergency stop cleared");
+            InRangeNumber = 0;
+        } else {
+            Serial.println("  [UART] Recovery disabled — staying in E-STOP");
+        }
+    }
+
+    automationThrottle = message[0];
+    automationSteering = message[1];
+}
+
+// ================================================================
+// EMERGENCY STOP
+// ================================================================
+void emergencyStopProcedure(const char* reason) {
+    if (emergencyStop) return;
+    emergencyStop = true;
+    analogWrite(PWM1,                   0);
+    digitalWrite(STEERING_LEFT_PIN,   LOW);
+    digitalWrite(STEERING_RIGHT_PIN,  LOW);
+    digitalWrite(KILL_SWITCH,         LOW);
+
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "EMERGENCY STOP");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 25, reason);
+    display.display();
+
+    Serial.printf("  [ESTOP] %s\n", reason);
+    // No while(true) — loop continues so recovery packets can be processed
+}
+
+// ================================================================
+// DISPLAY
+// ================================================================
+void updateDisplay() {
+    int pot       = analogRead(STEERING_POTENTIOMETER);
+    int targetPot = map(automationSteering, 0, 100, rudderMin, rudderMax);
+    int actualPct = map(throttle, 0, UINT16_MAX, 0, 100);
+    uint32_t hb   = millis() - lastHeartbeatTime;
+    bool overtemp = (currentTempF > TEMP_THROTTLE_CAP_F);
+
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+
+    char buf[40];
+
+    // Row 0 — status
+    if (emergencyStop) {
+        snprintf(buf, sizeof(buf), "*** E-STOP ***");
+    } else if (overtemp) {
+        snprintf(buf, sizeof(buf), "OVERTEMP - CAP 50%%");
+    } else {
+        snprintf(buf, sizeof(buf), "AUTO MODE");
+    }
+    display.drawString(0, 0, buf);
+
+    // Row 1 — throttle
+    snprintf(buf, sizeof(buf), "Cmd:%d%% Motor:~%d%%", automationThrottle, actualPct);
+    display.drawString(0, 13, buf);
+
+    // Row 2 — steering
+    snprintf(buf, sizeof(buf), "Steer:%d%%  Pot:%d", automationSteering, pot);
+    display.drawString(0, 26, buf);
+
+    // Row 3 — rudder target/error
+    snprintf(buf, sizeof(buf), "Tgt:%d  Err:%d", targetPot, pot - targetPot);
+    display.drawString(0, 39, buf);
+
+    // Row 4 — temperature + heartbeat
+    if (currentTempF > -999.0f) {
+        snprintf(buf, sizeof(buf), "Tmp:%.1fF  HB:%d.%ds",
+                 currentTempF, hb / 1000, (hb % 1000) / 100);
+    } else {
+        snprintf(buf, sizeof(buf), "Tmp:ERR  HB:%d.%ds",
+                 hb / 1000, (hb % 1000) / 100);
+    }
+    display.drawString(0, 52, buf);
+
+    display.display();
+}
+// ================================================================
+// SIMULATION
+// ================================================================
+void simDisplay(int packetNum, uint8_t thr, uint8_t steer, int pot, int rawThrottle, uint32_t elapsed, float tempF) {
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "SIM MODE");
+    display.setFont(ArialMT_Plain_10);
+
+    char buf[40];
+    snprintf(buf, sizeof(buf), "PKT %d/%d  T:%d S:%d",
+             packetNum + 1, SIM_PACKET_COUNT, thr, steer);
+    display.drawString(0, 13, buf);
+
+    int actualPct = map(rawThrottle, 0, UINT16_MAX, 0, 100);
+    int targetPot = map(steer, 0, 100, rudderMin, rudderMax);
+    snprintf(buf, sizeof(buf), "Motor:~%d%%  Pot:%d", actualPct, pot);
+    display.drawString(0, 26, buf);
+    snprintf(buf, sizeof(buf), "SteerTgt:%d Err:%d", targetPot, pot - targetPot);
+    display.drawString(0, 39, buf);
+
+    // Row 4 — temperature + overtemp warning
+    if (tempF > -999.0f) {
+        bool overtemp = (tempF > TEMP_THROTTLE_CAP_F);
+        snprintf(buf, sizeof(buf), "Tmp:%.1fF %s",
+                 tempF, overtemp ? "!CAP!" : "OK");
+    } else {
+        snprintf(buf, sizeof(buf), "Tmp:ERR");
+    }
+    display.drawString(0, 52, buf);
+
+    display.display();
+}
+
+void runSimulation() {
+    Serial.println("\n=== SIMULATION START ===");
+
+    for (int i = 0; i < SIM_PACKET_COUNT; i++) {
+        Serial.printf("\n[PKT %d/%d] T:%d  S:%d\n",
+                      i + 1, SIM_PACKET_COUNT,
+                      SIM_PACKETS[i][0], SIM_PACKETS[i][1]);
+
+        uint32_t holdStart = millis();
+        while (millis() - holdStart < SIM_HOLD_TIME_MS) {
+            uint8_t pkt[2] = {SIM_PACKETS[i][0], SIM_PACKETS[i][1]};
+            processUARTMessage(pkt, BUFFER_SIZE);
+            lastHeartbeatTime = millis();
+
+            currentTempF            = readThermistorF();
+            currentSteeringPosition = analogRead(STEERING_POTENTIOMETER);
+            executeAutomation();
+
+            int pct = map(throttle, 0, UINT16_MAX, 0, 100);
+         simDisplay(i, SIM_PACKETS[i][0], SIM_PACKETS[i][1],
+           currentSteeringPosition, throttle, millis() - holdStart, currentTempF);
+            Serial.printf("  Motor:~%d%% (raw:%d)  Pot:%d  SteerTgt:%d  Temp:%.1fF\n",
+                          pct, throttle, currentSteeringPosition,
+                          map(automationSteering, 0, 100, rudderMin, rudderMax),
+                          currentTempF);
+            delay(LOOP_INTERVAL_MS);
+        }
+    }
+
+    // Decelerate to full stop
+    Serial.println("\nDecelerating to stop...");
+    while (throttle > 0) {
+        uint8_t stopPkt[2] = {0, 50};
+        processUARTMessage(stopPkt, BUFFER_SIZE);
+        currentSteeringPosition = analogRead(STEERING_POTENTIOMETER);
+        executeAutomation();
+
+        int pct = map(throttle, 0, UINT16_MAX, 0, 100);
+        Serial.printf("  Decelerating: ~%d%%\n", pct);
+        display.clear();
+        display.setFont(ArialMT_Plain_16);
+        display.drawString(0, 0, "STOPPING...");
+        display.setFont(ArialMT_Plain_10);
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Motor: ~%d%%", pct);
+        display.drawString(0, 25, buf);
+        display.display();
+        delay(LOOP_INTERVAL_MS);
+    }
+
+    Serial.println("\n=== SIMULATION COMPLETE ===");
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "SIM DONE");
+    display.setFont(ArialMT_Plain_10);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "Final pot: %d", analogRead(STEERING_POTENTIOMETER));
+    display.drawString(0, 25, buf);
+    display.drawString(0, 40, "Re-upload to rerun");
+    display.display();
+
+    analogWrite(PWM1,                  0);
+    digitalWrite(STEERING_LEFT_PIN,  LOW);
+    digitalWrite(STEERING_RIGHT_PIN, LOW);
+    while (true) { delay(1000); }
+}
