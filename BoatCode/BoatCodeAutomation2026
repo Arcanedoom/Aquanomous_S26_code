@@ -1,0 +1,291 @@
+#include <Wire.h>
+#include "HT_SSD1306Wire.h"
+#include "Arduino.h"
+
+// ================================================================
+// CONFIGURATION
+// ================================================================
+#define TEST_MODE            false
+#define ALLOW_RECOVERY       true
+
+#define THROTTLE_RAMP_MS     4000
+#define THROTTLE_DECEL_MS    4000
+#define LOOP_INTERVAL_MS     100
+#define HEARTBEAT_TIMEOUT_MS 10000
+#define ESTOP_TRIGGER_COUNT  3
+#define RECOVERY_COUNT       3
+
+#define TEMP_THROTTLE_CAP_F    338.0f
+#define TEMP_THROTTLE_CAP_PCT  50
+
+// ================================================================
+// UART
+// ================================================================
+#define BUFFER_SIZE 2
+
+uint8_t serialBuffer[256];
+int bufferSize = 0;
+
+// ================================================================
+// PIN DEFINITIONS
+// ================================================================
+#define DIRECTION_PIN          GPIO5
+#define STEERING_LEFT_PIN      GPIO7
+#define STEERING_RIGHT_PIN     GPIO6
+#define MOTOR_RELAY            GPIO4
+#define KILL_SWITCH            GPIO9
+#define STEERING_POTENTIOMETER ADC3
+
+// ================================================================
+// THERMISTOR
+// ================================================================
+#define THERM_PIN           ADC1
+#define ADC_RESOLUTION      4096.0f
+#define ADC_REF_VOLTAGE     3.3f
+#define ADC_CAL_FACTOR      0.7099f
+#define SERIES_RESISTOR     10000.0f
+#define NOMINAL_RESISTANCE  10000.0f
+#define NOMINAL_TEMP_C      25.0f
+#define BETA_COEFFICIENT    3950.0f
+
+// ================================================================
+// RUDDER CALIBRATION
+// ================================================================
+const int rudderMin       = 200;
+const int rudderMax       = 4000;
+const int rudderTolerance = 50;
+
+// ================================================================
+// STATE
+// ================================================================
+int automationThrottle      = 0;
+int automationSteering      = 50;
+int currentSteeringPosition = 0;
+
+int throttle      = 0;
+int throttleState = 0;
+
+bool     emergencyStop     = false;
+bool     heartbeatStarted  = false;   // ✅ NEW
+uint32_t lastHeartbeatTime = 0;
+
+int OutofRangeNumber  = 0;
+int InRangeNumber     = 0;
+
+float currentTempF = 0.0f;
+
+static SSD1306Wire display(0x3c, 500000, SDA, SCL, GEOMETRY_128_64, GPIO10);
+
+// ================================================================
+// SETUP
+// ================================================================
+void setup() {
+    Serial.begin(115200);
+    Serial1.begin(9600);
+
+    pinMode(DIRECTION_PIN,          OUTPUT);
+    pinMode(STEERING_LEFT_PIN,      OUTPUT);
+    pinMode(STEERING_RIGHT_PIN,     OUTPUT);
+    pinMode(MOTOR_RELAY,            OUTPUT);
+    pinMode(KILL_SWITCH,            OUTPUT);
+    pinMode(STEERING_POTENTIOMETER, INPUT);
+    pinMode(THERM_PIN,              INPUT);
+
+    analogWrite(PWM1, 0);
+    digitalWrite(DIRECTION_PIN, LOW);
+    digitalWrite(STEERING_LEFT_PIN, LOW);
+    digitalWrite(STEERING_RIGHT_PIN, LOW);
+    digitalWrite(MOTOR_RELAY, HIGH);
+    digitalWrite(KILL_SWITCH, HIGH);
+
+    display.init();
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "AUTO MODE");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 25, "Waiting for UART...");
+    display.display();
+
+    delay(3000);
+
+    // ❌ REMOVED: lastHeartbeatTime = millis();
+}
+
+// ================================================================
+// LOOP
+// ================================================================
+void loop() {
+
+    if (Serial1.available() >= BUFFER_SIZE) {
+        bufferSize = Serial1.readBytes(serialBuffer, BUFFER_SIZE);
+
+        if (bufferSize == BUFFER_SIZE) {
+            processUARTMessage(serialBuffer, bufferSize);
+
+            if (!heartbeatStarted) {
+                heartbeatStarted = true;
+                Serial.println("[HEARTBEAT] Started");
+            }
+
+            lastHeartbeatTime = millis();
+        }
+    }
+
+    // ✅ Only check timeout AFTER heartbeat starts
+    if (heartbeatStarted &&
+        millis() - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
+        emergencyStopProcedure("NO HEARTBEAT");
+    }
+
+    currentTempF            = readThermistorF();
+    currentSteeringPosition = analogRead(STEERING_POTENTIOMETER);
+
+    executeAutomation();
+    updateDisplay();
+
+    delay(LOOP_INTERVAL_MS);
+}
+
+// ================================================================
+// UART PROCESSING
+// ================================================================
+void processUARTMessage(uint8_t *message, int length) {
+    if (length != BUFFER_SIZE) return;
+
+    if (message[0] > 100 || message[1] > 100) {
+        OutofRangeNumber++;
+        InRangeNumber = 0;
+
+        if (OutofRangeNumber >= ESTOP_TRIGGER_COUNT) {
+            emergencyStopProcedure("OUT OF RANGE CMD");
+        }
+        return;
+    }
+
+    // GOOD PACKET
+    OutofRangeNumber = 0;
+
+    if (emergencyStop) {
+        InRangeNumber++;
+
+        if (InRangeNumber >= RECOVERY_COUNT) {
+            if (ALLOW_RECOVERY) {
+                emergencyStop = false;
+                digitalWrite(KILL_SWITCH, HIGH);
+                Serial.println("[RECOVERY] Cleared");
+            }
+            InRangeNumber = 0;
+        }
+    }
+
+    automationThrottle = message[0];
+    automationSteering = message[1];
+}
+
+// ================================================================
+// THERMISTOR
+// ================================================================
+float readThermistorF() {
+    int raw = analogRead(THERM_PIN);
+
+    float voltage = (raw / ADC_RESOLUTION) *
+                    ADC_REF_VOLTAGE * ADC_CAL_FACTOR;
+
+    if (voltage <= 0.0f || voltage >= 3.3f) return -999.0f;
+
+    float resistance = SERIES_RESISTOR *
+                       (voltage / (3.3f - voltage));
+
+    float steinhart = resistance / NOMINAL_RESISTANCE;
+    steinhart = log(steinhart);
+    steinhart /= BETA_COEFFICIENT;
+    steinhart += 1.0f / (NOMINAL_TEMP_C + 273.15f);
+    steinhart = 1.0f / steinhart;
+
+    return (steinhart - 273.15f) * 9.0f / 5.0f + 32.0f;
+}
+
+// ================================================================
+// CONTROL
+// ================================================================
+void executeAutomation() {
+    if (emergencyStop) return;
+    controlThrottle();
+    controlSteering();
+}
+
+void controlThrottle() {
+    int targetPWM = (automationThrottle * UINT16_MAX) / 100;
+    int rampStep  = (UINT16_MAX * LOOP_INTERVAL_MS) / THROTTLE_RAMP_MS;
+    int decelStep = (UINT16_MAX * LOOP_INTERVAL_MS) / THROTTLE_DECEL_MS;
+
+    if (automationThrottle > 0) {
+        if (throttleState != 1) {
+            throttleState = 1;
+            digitalWrite(DIRECTION_PIN, LOW);
+        }
+
+        throttle += rampStep;
+        throttle  = min(throttle, targetPWM);
+
+        if (currentTempF > TEMP_THROTTLE_CAP_F) {
+            int capPWM = (TEMP_THROTTLE_CAP_PCT * UINT16_MAX) / 100;
+            throttle   = min(throttle, capPWM);
+        }
+
+        analogWrite(PWM1, throttle);
+    } else {
+        throttle -= decelStep;
+        throttle = max(throttle, 0);
+        analogWrite(PWM1, throttle);
+    }
+}
+
+void controlSteering() {
+    int target = map(automationSteering, 0, 100, rudderMin, rudderMax);
+    int error  = currentSteeringPosition - target;
+
+    if (abs(error) <= rudderTolerance) {
+        digitalWrite(STEERING_LEFT_PIN, LOW);
+        digitalWrite(STEERING_RIGHT_PIN, LOW);
+        return;
+    }
+
+    digitalWrite(STEERING_LEFT_PIN,  error > 0);
+    digitalWrite(STEERING_RIGHT_PIN, error < 0);
+}
+
+// ================================================================
+// E-STOP
+// ================================================================
+void emergencyStopProcedure(const char* reason) {
+    if (emergencyStop) return;
+
+    emergencyStop = true;
+
+    analogWrite(PWM1, 0);
+    digitalWrite(STEERING_LEFT_PIN, LOW);
+    digitalWrite(STEERING_RIGHT_PIN, LOW);
+    digitalWrite(KILL_SWITCH, LOW);
+
+    Serial.printf("[ESTOP] %s\n", reason);
+}
+
+// ================================================================
+// DISPLAY
+// ================================================================
+void updateDisplay() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+
+    if (!heartbeatStarted) {
+        display.drawString(0, 0, "WAITING FOR UART...");
+    } else if (emergencyStop) {
+        display.drawString(0, 0, "*** E-STOP ***");
+    } else {
+        display.drawString(0, 0, "AUTO MODE");
+    }
+
+    display.display();
+}
